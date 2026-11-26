@@ -1,0 +1,148 @@
+import cv2
+import numpy as np
+import time
+import threading
+
+# ---------------- SPEECH ----------------
+try:
+    import pyttsx3
+    engine = pyttsx3.init()
+    engine.setProperty('rate', 160)
+    SPEECH = True
+except:
+    SPEECH = False
+
+def speak_async(msg):
+    if SPEECH:
+        threading.Thread(target=lambda: engine.say(msg) or engine.runAndWait(), daemon=True).start()
+
+# ---------------- YOLO TINY ----------------
+YOLO_WEIGHTS = "yolov3.weights"
+YOLO_CFG     = "yolov3.cfg"
+YOLO_NAMES   = "coco.names"
+
+CONF_THRESHOLD = 0.4
+NMS_THRESHOLD  = 0.3
+
+net = cv2.dnn.readNet(YOLO_WEIGHTS, YOLO_CFG)
+layer_names = net.getLayerNames()
+out_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers().flatten()]
+
+with open(YOLO_NAMES) as f:
+    classes = [c.strip() for c in f.readlines()]
+
+# ---------------- DIRECTION LOGIC ----------------
+def get_direction(cx, width):
+    if cx < width / 3:
+        return "LEFT"
+    elif cx > 2 * width / 3:
+        return "RIGHT"
+    else:
+        return "CENTER"
+
+# ---------------- CAMERA ----------------
+cap = cv2.VideoCapture(0)
+cap.set(3, 320)
+cap.set(4, 240)
+
+if not cap.isOpened():
+    print("Camera error")
+    exit()
+
+print("? Blind Assist Running | Press Q to exit")
+
+last_speak = 0
+last_msg = ""
+frame_count = 0
+
+# ---------------- MAIN LOOP ----------------
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame_count += 1
+
+    # Skip frames for speed
+    if frame_count % 2 != 0:
+        cv2.imshow("Blind Assist", frame)
+        if cv2.waitKey(1) == ord('q'):
+            break
+        continue
+
+    h, w = frame.shape[:2]
+
+    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (320, 320), swapRB=True)
+    net.setInput(blob)
+    outputs = net.forward(out_layers)
+
+    boxes, confidences, class_ids = [], [], []
+
+    for output in outputs:
+        for det in output:
+            scores = det[5:]
+            cid = np.argmax(scores)
+            conf = scores[cid]
+
+            if conf > CONF_THRESHOLD:
+                cx, cy = int(det[0]*w), int(det[1]*h)
+                bw, bh = int(det[2]*w), int(det[3]*h)
+                x, y = cx - bw//2, cy - bh//2
+
+                boxes.append([x, y, bw, bh])
+                confidences.append(float(conf))
+                class_ids.append(cid)
+
+    indices = cv2.dnn.NMSBoxes(boxes, confidences, CONF_THRESHOLD, NMS_THRESHOLD)
+
+    best_object = None
+
+    # Pick nearest object (largest box)
+    max_area = 0
+
+    if len(indices) > 0:
+        for i in indices.flatten():
+            x, y, bw, bh = boxes[i]
+            area = bw * bh
+
+            if area > max_area:
+                max_area = area
+                cx = x + bw//2
+                label = classes[class_ids[i]]
+                direction = get_direction(cx, w)
+                best_object = (label, direction, x, y, bw, bh)
+
+    # Draw + Decision
+    if best_object:
+        label, direction, x, y, bw, bh = best_object
+
+        color = (0,255,0) if direction=="CENTER" else (0,165,255) if direction=="LEFT" else (0,0,255)
+
+        cv2.rectangle(frame,(x,y),(x+bw,y+bh),color,2)
+        cv2.putText(frame,f"{label} {direction}",(x,y-5),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.6,color,2)
+
+        # ? SMART GUIDANCE
+        if direction == "LEFT":
+            command = f"{label} on left, move right"
+        elif direction == "RIGHT":
+            command = f"{label} on right, move left"
+        else:
+            command = f"{label} ahead"
+
+        # Speak every 3 sec
+        now = time.time()
+        if now - last_speak > 3:
+            if command != last_msg:
+                last_msg = command
+                last_speak = now
+                print("?", command)
+                speak_async(command)
+
+    cv2.imshow("Blind Assist", frame)
+
+    if cv2.waitKey(1) == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
